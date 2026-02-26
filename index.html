@@ -83,7 +83,7 @@
           <input id="aReq" type="number" value="1000" min="400" max="2000" step="10" />
         </div>
         <div>
-          <label>Decoder B req (ms)</label>
+          <label>Decoder B window (ms)</label>
           <input id="bReq" type="number" value="3000" min="800" max="6000" step="10" />
         </div>
       </div>
@@ -91,26 +91,30 @@
       <div class="row">
         <div>
           <label>Confidence ratio</label>
-          <input id="ratio" type="number" value="1.3" min="1.05" max="3.0" step="0.05" />
+          <input id="ratio" type="number" value="1.20" min="1.05" max="3.0" step="0.05" />
         </div>
         <div>
           <label>Dropout tolerance (ms)</label>
-          <input id="dropout" type="number" value="120" min="0" max="500" step="10" />
+          <input id="dropout" type="number" value="220" min="0" max="600" step="10" />
         </div>
         <div>
           <label>Reset silence (ms)</label>
-          <input id="resetSilence" type="number" value="300" min="0" max="1500" step="25" />
+          <input id="resetSilence" type="number" value="500" min="0" max="1500" step="25" />
         </div>
       </div>
 
       <div class="row">
         <div>
-          <label>B timeout grace (ms)</label>
-          <input id="bGrace" type="number" value="700" min="0" max="2000" step="25" />
+          <label>B winner ratio (top/2nd)</label>
+          <input id="bWinRatio" type="number" value="1.20" min="1.05" max="3.0" step="0.05" />
         </div>
         <div>
-          <label class="muted">B timeout = B req + grace</label>
-          <input disabled value="(auto)" />
+          <label>Min B “coverage” (%)</label>
+          <input id="bCoverage" type="number" value="55" min="10" max="100" step="1" />
+        </div>
+        <div>
+          <label class="muted">Voting = mic-friendly</label>
+          <input disabled value="(on)" />
         </div>
       </div>
 
@@ -125,7 +129,7 @@
       </div>
 
       <p class="muted" style="margin:10px 0 0;">
-        Tip: for best decode, keep the phone close to the mic and keep the room quiet.
+        Tip: If B still struggles, lower Confidence ratio a bit (1.15) and increase Dropout tolerance (250–300).
       </p>
     </div>
 
@@ -177,7 +181,7 @@ function populateTones() {
     optB.textContent = f.toFixed(1);
     b.appendChild(optB);
   }
-  // Defaults for your test case:
+  // Defaults for your test:
   a.value = "457.9";
   b.value = "1034.0";
 }
@@ -259,7 +263,7 @@ const DecoderState = {
 
 let state = DecoderState.IDLE;
 
-// Stability tracking (mic-friendly)
+// Stability tracking (A detection)
 let stableTone = null;
 let stableMs = 0;
 let dropoutMs = 0;
@@ -268,8 +272,18 @@ let silenceMs = 0;
 let gotA = null;
 let lastB = null;
 
-// NEW: timer for how long we've been searching for B after getting A
+// B voting window accumulators
 let bElapsedMs = 0;
+let bScore = new Map();      // tone -> score
+let bDetectMs = new Map();   // tone -> ms detected (coverage)
+let bTotalDetectMs = 0;
+
+function resetBWindow() {
+  bElapsedMs = 0;
+  bScore.clear();
+  bDetectMs.clear();
+  bTotalDetectMs = 0;
+}
 
 // Exact-frequency Goertzel (no bin rounding)
 function goertzelPower(frame, sampleRate, targetFreq) {
@@ -322,8 +336,7 @@ function resetDecoder() {
   dropoutMs = 0;
   silenceMs = 0;
   gotA = null;
-  bElapsedMs = 0;
-  // keep lastB so we can ignore B tails
+  resetBWindow();
   setPill("decodeState", "Decoder: seeking A", "warn");
 }
 
@@ -366,14 +379,12 @@ $("btnMic").addEventListener("click", async () => {
 
   micSource = audioCtx.createMediaStreamSource(micStream);
 
-  // 4096 is more stable for low tones (457.9 etc.) than 2048.
   const bufSize = 4096;
   processor = audioCtx.createScriptProcessor(bufSize, 1, 1);
 
-  // Connect graph: mic -> processor -> zero gain -> destination
-  // (processor must connect somewhere to run)
   micSource.connect(processor);
 
+  // processor must connect somewhere to run; use zero gain to avoid feedback
   zeroGainSink = audioCtx.createGain();
   zeroGainSink.gain.value = 0;
   processor.connect(zeroGainSink);
@@ -388,23 +399,24 @@ $("btnMic").addEventListener("click", async () => {
   processor.onaudioprocess = (evt) => {
     if (state === DecoderState.IDLE) return;
 
-    const A_REQ = parseFloat($("aReq").value);        // ms
-    const B_REQ = parseFloat($("bReq").value);        // ms
-    const RATIO_MIN = parseFloat($("ratio").value);   // dimensionless
-    const MAX_DROPOUT = parseFloat($("dropout").value); // ms
-    const RESET_SILENCE = parseFloat($("resetSilence").value); // ms
-    const B_GRACE = parseFloat($("bGrace").value);    // ms
-    const B_TIMEOUT = B_REQ + B_GRACE;                // ms
+    const A_REQ = parseFloat($("aReq").value);          // ms
+    const B_REQ = parseFloat($("bReq").value);          // ms (window length)
+    const RATIO_MIN = parseFloat($("ratio").value);
+    const MAX_DROPOUT = parseFloat($("dropout").value);
+    const RESET_SILENCE = parseFloat($("resetSilence").value);
+
+    const B_WIN_RATIO = parseFloat($("bWinRatio").value); // top/2nd
+    const B_COV_PCT = parseFloat($("bCoverage").value);   // 0..100
 
     const input = evt.inputBuffer.getChannelData(0);
     const dom = findDominantTone(input, audioCtx.sampleRate, RATIO_MIN);
     const nowTone = dom ? dom.freq : null;
 
-    // Track silence
+    // Track silence (for reset arming)
     if (!nowTone) silenceMs += frameMs;
     else silenceMs = 0;
 
-    // Update stable tone with dropout tolerance
+    // --- A: stable-time tracker (dropout tolerant) ---
     if (nowTone === null) {
       dropoutMs += frameMs;
       if (dropoutMs > MAX_DROPOUT) {
@@ -428,12 +440,14 @@ $("btnMic").addEventListener("click", async () => {
 
       if (stableTone !== null && stableMs >= A_REQ) {
         gotA = stableTone;
-        bElapsedMs = 0; // NEW: start B search timer now
         log(`DECODE: got A=${gotA.toFixed(1)}Hz (stable ${(stableMs/1000).toFixed(2)}s, ratio ${dom ? dom.ratio.toFixed(2) : "?"})`);
-        setPill("decodeState", `Decoder: got A=${gotA.toFixed(1)}Hz, seeking B`, "warn");
+        setPill("decodeState", `Decoder: got A=${gotA.toFixed(1)}Hz, measuring B...`, "warn");
 
+        // Move to B voting window
         state = DecoderState.SEEK_B;
-        // Reset stability so B doesn't inherit A time
+        resetBWindow();
+
+        // Reset A stability so it doesn't affect B
         stableTone = null;
         stableMs = 0;
         dropoutMs = 0;
@@ -441,69 +455,111 @@ $("btnMic").addEventListener("click", async () => {
       }
 
     } else if (state === DecoderState.SEEK_B) {
-      // NEW: advance the B window timer
+      // Accumulate for exactly B_REQ ms (window)
       bElapsedMs += frameMs;
 
-      // NEW: fail out if B hasn't been found within timeout window
-      if (bElapsedMs >= B_TIMEOUT) {
-        log(`QCII FAILED: A=${gotA ? gotA.toFixed(1) : "?"}Hz, B not detected within ${(B_TIMEOUT/1000).toFixed(2)}s`);
-        setPill("decodeState", "Decoder: FAILED (no B)", "bad");
+      // Vote only when we have a confident tone and it's not equal to A
+      if (dom && dom.freq !== null && gotA !== null && dom.freq !== gotA) {
+        const f = dom.freq;
 
-        state = DecoderState.WAIT_RESET;
+        // Weight votes by ratio (cap it so one spike doesn't dominate)
+        const w = Math.min(3.0, Math.max(1.0, dom.ratio));
 
-        // Reset trackers
-        stableTone = null;
-        stableMs = 0;
-        dropoutMs = 0;
-        silenceMs = 0;
-
-        gotA = null;
-        bElapsedMs = 0;
-
-        // Since we didn't actually lock a B, don't keep blocking future A with lastB
-        lastB = null;
-
-        return;
+        bScore.set(f, (bScore.get(f) || 0) + w);
+        bDetectMs.set(f, (bDetectMs.get(f) || 0) + frameMs);
+        bTotalDetectMs += frameMs;
       }
 
-      // Prevent "A=A" false decode
-      if (stableTone !== null && gotA !== null && stableTone === gotA) return;
+      if (bElapsedMs >= B_REQ) {
+        // Decide winner
+        const entries = Array.from(bScore.entries()).sort((a,b)=>b[1]-a[1]);
+        const top = entries[0];
+        const second = entries[1];
 
-      if (stableTone !== null && stableMs >= B_REQ) {
-        const gotB = stableTone;
-        lastB = gotB;
+        const topFreq = top ? top[0] : null;
+        const topScore = top ? top[1] : 0;
+        const secondScore = second ? second[1] : 1e-9;
 
-        log(`DECODE: got B=${gotB.toFixed(1)}Hz (stable ${(stableMs/1000).toFixed(2)}s, ratio ${dom ? dom.ratio.toFixed(2) : "?"})`);
-        log(`QCII RESULT: A=${gotA.toFixed(1)}Hz, B=${gotB.toFixed(1)}Hz`);
-        setPill("decodeState", `Decoder: QCII A=${gotA.toFixed(1)} B=${gotB.toFixed(1)}`, "ok");
+        const winRatio = topScore / Math.max(1e-9, secondScore);
 
-        // Require reset condition so B tail doesn't become next A
+        const topMs = topFreq ? (bDetectMs.get(topFreq) || 0) : 0;
+        const coverage = (topMs / Math.max(1e-9, B_REQ)) * 100;
+
+        const enoughCoverage = coverage >= B_COV_PCT;
+        const clearWinner = winRatio >= B_WIN_RATIO;
+
+        if (topFreq !== null && enoughCoverage && clearWinner) {
+          const gotB = topFreq;
+          lastB = gotB;
+
+          log(`DECODE: got B=${gotB.toFixed(1)}Hz (vote coverage ${coverage.toFixed(0)}%, winRatio ${winRatio.toFixed(2)})`);
+          log(`QCII RESULT: A=${gotA.toFixed(1)}Hz, B=${gotB.toFixed(1)}Hz`);
+          setPill("decodeState", `Decoder: QCII A=${gotA.toFixed(1)} B=${gotB.toFixed(1)}`, "ok");
+        } else {
+          log(`QCII FAILED: A=${gotA ? gotA.toFixed(1) : "?"}Hz, B not reliable (coverage ${coverage.toFixed(0)}%, winRatio ${winRatio.toFixed(2)})`);
+          setPill("decodeState", "Decoder: FAILED (no reliable B)", "bad");
+          // We did NOT lock a B
+          lastB = null;
+        }
+
+        // After decision (pass or fail), require reset before next A
         state = DecoderState.WAIT_RESET;
         stableTone = null;
         stableMs = 0;
         dropoutMs = 0;
         silenceMs = 0;
         gotA = null;
-        bElapsedMs = 0;
+        resetBWindow();
         return;
       }
 
     } else if (state === DecoderState.WAIT_RESET) {
-      // Wait for some silence before re-arming
       if (silenceMs >= RESET_SILENCE) {
         state = DecoderState.SEEK_A;
         setPill("decodeState", "Decoder: seeking A", "warn");
         stableTone = null;
         stableMs = 0;
         dropoutMs = 0;
-        bElapsedMs = 0;
-        // keep lastB to ignore echoes/tails
+        resetBWindow();
         return;
       }
     }
   };
 
   log("Decoder started (mic).");
+});
+
+$("btnStop").addEventListener("click", () => {
+  stopDecoder();
+  $("btnStop").disabled = true;
+  log("Decoder stopped.");
+});
+
+// Encoder controls
+$("btnInit").addEventListener("click", async () => {
+  ensureAudio();
+  if (audioCtx.state !== "running") await audioCtx.resume();
+  setPill("audioState", `Audio: ${audioCtx.state}`, "ok");
+  $("btnPlay").disabled = false;
+  $("btnMic").disabled = false;
+  log("Audio started.");
+});
+
+$("btnPlay").addEventListener("click", () => {
+  ensureAudio();
+  const toneA = parseFloat($("toneA").value);
+  const toneB = parseFloat($("toneB").value);
+  const durA = parseFloat($("durA").value) / 1000;
+  const gap  = parseFloat($("gap").value) / 1000;
+  const durB = parseFloat($("durB").value) / 1000;
+  const level = Math.min(0.9, Math.max(0.01, parseFloat($("level").value)));
+
+  outGain.gain.value = level;
+  const t0 = audioCtx.currentTime + 0.05;
+  playTone(toneA, t0, durA, level);
+  playTone(toneB, t0 + durA + gap, durB, level);
+
+  log(`ENCODE: A=${toneA.toFixed(1)}Hz for ${durA.toFixed(2)}s, gap=${gap.toFixed(2)}s, B=${toneB.toFixed(1)}Hz for ${durB.toFixed(2)}s`);
 });
 
 $("btnStop").addEventListener("click", () => {
