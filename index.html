@@ -233,18 +233,17 @@ let toneHoldMs = 0;
 let gotA = null;
 
 function goertzelPower(frame, sampleRate, targetFreq) {
-  const N = frame.length;
-  const k = Math.round((N * targetFreq) / sampleRate);
-  const w = (2 * Math.PI / N) * k;
-  const coeff = 2 * Math.cos(w);
+  const omega = 2 * Math.PI * (targetFreq / sampleRate);
+  const coeff = 2 * Math.cos(omega);
 
   let s0 = 0, s1 = 0, s2 = 0;
-  for (let i = 0; i < N; i++) {
+  for (let i = 0; i < frame.length; i++) {
     s0 = frame[i] + coeff * s1 - s2;
     s2 = s1;
     s1 = s0;
   }
-  return (s2 * s2) + (s1 * s1) - (coeff * s1 * s2);
+  // power estimate
+  return (s1 * s1) + (s2 * s2) - (coeff * s1 * s2);
 }
 
 function nearestTone(freq) {
