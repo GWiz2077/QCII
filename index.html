@@ -103,6 +103,17 @@
         </div>
       </div>
 
+      <div class="row">
+        <div>
+          <label>B timeout grace (ms)</label>
+          <input id="bGrace" type="number" value="700" min="0" max="2000" step="25" />
+        </div>
+        <div>
+          <label class="muted">B timeout = B req + grace</label>
+          <input disabled value="(auto)" />
+        </div>
+      </div>
+
       <div class="row" style="margin-top:12px;">
         <button id="btnInit">Start Audio</button>
         <button id="btnPlay" disabled>Play QCII</button>
@@ -257,6 +268,9 @@ let silenceMs = 0;
 let gotA = null;
 let lastB = null;
 
+// NEW: timer for how long we've been searching for B after getting A
+let bElapsedMs = 0;
+
 // Exact-frequency Goertzel (no bin rounding)
 function goertzelPower(frame, sampleRate, targetFreq) {
   const omega = 2 * Math.PI * (targetFreq / sampleRate);
@@ -308,6 +322,7 @@ function resetDecoder() {
   dropoutMs = 0;
   silenceMs = 0;
   gotA = null;
+  bElapsedMs = 0;
   // keep lastB so we can ignore B tails
   setPill("decodeState", "Decoder: seeking A", "warn");
 }
@@ -378,6 +393,8 @@ $("btnMic").addEventListener("click", async () => {
     const RATIO_MIN = parseFloat($("ratio").value);   // dimensionless
     const MAX_DROPOUT = parseFloat($("dropout").value); // ms
     const RESET_SILENCE = parseFloat($("resetSilence").value); // ms
+    const B_GRACE = parseFloat($("bGrace").value);    // ms
+    const B_TIMEOUT = B_REQ + B_GRACE;                // ms
 
     const input = evt.inputBuffer.getChannelData(0);
     const dom = findDominantTone(input, audioCtx.sampleRate, RATIO_MIN);
@@ -411,6 +428,7 @@ $("btnMic").addEventListener("click", async () => {
 
       if (stableTone !== null && stableMs >= A_REQ) {
         gotA = stableTone;
+        bElapsedMs = 0; // NEW: start B search timer now
         log(`DECODE: got A=${gotA.toFixed(1)}Hz (stable ${(stableMs/1000).toFixed(2)}s, ratio ${dom ? dom.ratio.toFixed(2) : "?"})`);
         setPill("decodeState", `Decoder: got A=${gotA.toFixed(1)}Hz, seeking B`, "warn");
 
@@ -423,6 +441,31 @@ $("btnMic").addEventListener("click", async () => {
       }
 
     } else if (state === DecoderState.SEEK_B) {
+      // NEW: advance the B window timer
+      bElapsedMs += frameMs;
+
+      // NEW: fail out if B hasn't been found within timeout window
+      if (bElapsedMs >= B_TIMEOUT) {
+        log(`QCII FAILED: A=${gotA ? gotA.toFixed(1) : "?"}Hz, B not detected within ${(B_TIMEOUT/1000).toFixed(2)}s`);
+        setPill("decodeState", "Decoder: FAILED (no B)", "bad");
+
+        state = DecoderState.WAIT_RESET;
+
+        // Reset trackers
+        stableTone = null;
+        stableMs = 0;
+        dropoutMs = 0;
+        silenceMs = 0;
+
+        gotA = null;
+        bElapsedMs = 0;
+
+        // Since we didn't actually lock a B, don't keep blocking future A with lastB
+        lastB = null;
+
+        return;
+      }
+
       // Prevent "A=A" false decode
       if (stableTone !== null && gotA !== null && stableTone === gotA) return;
 
@@ -441,6 +484,7 @@ $("btnMic").addEventListener("click", async () => {
         dropoutMs = 0;
         silenceMs = 0;
         gotA = null;
+        bElapsedMs = 0;
         return;
       }
 
@@ -452,6 +496,7 @@ $("btnMic").addEventListener("click", async () => {
         stableTone = null;
         stableMs = 0;
         dropoutMs = 0;
+        bElapsedMs = 0;
         // keep lastB to ignore echoes/tails
         return;
       }
