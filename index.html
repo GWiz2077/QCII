@@ -1,47 +1,402 @@
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
-IN DEVELOPMENT
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>QCII Encoder / Decoder (Single-File)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background:#0b0f14; color:#e8eef6; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .card { background:#101826; border:1px solid #1b2a41; border-radius: 14px; padding: 14px; }
+  label { display:block; font-size: 12px; opacity:.9; margin: 10px 0 6px; }
+  select, input, button {
+    width: 100%; box-sizing: border-box;
+    border-radius: 12px; border: 1px solid #263a57;
+    background: #0c1320; color:#e8eef6;
+    padding: 10px 12px; font-size: 14px;
+  }
+  input[type="number"] { appearance: textfield; }
+  .row { display:flex; gap: 10px; }
+  .row > * { flex: 1; }
+  button { cursor: pointer; background: #14243a; }
+  button:hover { background:#193052; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .log {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px; line-height: 1.4;
+    background:#0a0f18; border:1px solid #1b2a41; border-radius: 12px;
+    padding: 10px; height: 260px; overflow:auto;
+    white-space: pre-wrap;
+  }
+  .pill { display:inline-block; padding: 3px 8px; border-radius: 999px; border:1px solid #263a57; background:#0c1320; font-size: 12px; }
+  .status { display:flex; gap:10px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+  .muted { opacity: .8; font-size: 12px; }
+  .ok { border-color:#2b6; }
+  .warn { border-color:#e6b422; }
+  .bad { border-color:#e25555; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>QCII Encoder / Decoder (single index.html)</h1>
+  <div class="grid">
+    <div class="card">
+      <div class="status">
+        <span class="pill" id="audioState">Audio: not started</span>
+        <span class="pill" id="micState">Mic: off</span>
+        <span class="pill" id="decodeState">Decoder: idle</span>
+      </div>
+
+      <label>Tone A (Hz)</label>
+      <select id="toneA"></select>
+
+      <label>Tone B (Hz)</label>
+      <select id="toneB"></select>
+
+      <div class="row">
+        <div>
+          <label>Duration A (ms)</label>
+          <input id="durA" type="number" value="1000" min="200" max="5000" />
+        </div>
+        <div>
+          <label>Gap (ms)</label>
+          <input id="gap" type="number" value="0" min="0" max="2000" />
+        </div>
+        <div>
+          <label>Duration B (ms)</label>
+          <input id="durB" type="number" value="3000" min="200" max="8000" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>Output Level</label>
+          <input id="level" type="number" value="0.2" min="0.01" max="0.9" step="0.01" />
+        </div>
+        <div>
+          <label>Band tolerance (Hz)</label>
+          <input id="tol" type="number" value="10" min="2" max="30" step="1" />
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:12px;">
+        <button id="btnInit">Start Audio</button>
+        <button id="btnPlay" disabled>Play QCII</button>
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <button id="btnMic" disabled>Start Mic Decode</button>
+        <button id="btnStop" disabled>Stop Decode</button>
+      </div>
+
+      <p class="muted" style="margin:10px 0 0;">
+        Tip: hold your radio/mic close. If it’s failing, increase output level or lower background noise.
+      </p>
+    </div>
+
+    <div class="card">
+      <label>Log</label>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+/**
+ * QCII single-file demo:
+ * - Encoder: WebAudio Oscillator -> Gain (schedule A, optional gap, then B).
+ * - Decoder: microphone -> ScriptProcessor -> Goertzel scan across QCII table.
+ *
+ * Practical notes:
+ * - ScriptProcessor is deprecated but still widely supported and simplest in one file.
+ * - For production/low-latency, swap to AudioWorklet.
+ */
+
+// A trimmed QCII-ish list to start. Expand with full QCII tone tables as needed.
+const QCII_FREQS = [
+  433.7, 457.9, 483.5, 510.5, 539.0, 569.1, 600.9, 634.5, 669.9, 707.3,
+  746.8, 788.5, 832.5, 879.0, 928.1, 979.9, 1034.0, 1092.4, 1153.4, 1218.5,
+  1285.8, 1351.6, 1418.1, 1485.4, 1553.4, 1622.2, 1691.8
+];
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+function log(msg) {
+  const ts = new Date().toLocaleTimeString();
+  logEl.textContent += `[${ts}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setPill(id, text, cls) {
+  const el = $(id);
+  el.textContent = text;
+  el.classList.remove("ok","warn","bad");
+  if (cls) el.classList.add(cls);
+}
+
+function populateTones() {
+  const a = $("toneA");
+  const b = $("toneB");
+  for (const f of QCII_FREQS) {
+    const optA = document.createElement("option");
+    optA.value = f; optA.textContent = f.toFixed(1);
+    a.appendChild(optA);
+
+    const optB = document.createElement("option");
+    optB.value = f; optB.textContent = f.toFixed(1);
+    b.appendChild(optB);
+  }
+  // Some pleasant defaults
+  a.value = "669.9";
+  b.value = "433.7";
+}
+populateTones();
+
+// ===== Encoder (Web Audio) =====
+let audioCtx = null;
+let outGain = null;
+
+function ensureAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    outGain = audioCtx.createGain();
+    outGain.gain.value = 0.2;
+    outGain.connect(audioCtx.destination);
+    setPill("audioState", `Audio: ${audioCtx.state}`, "ok");
+  }
+}
+
+$("btnInit").addEventListener("click", async () => {
+  ensureAudio();
+  if (audioCtx.state !== "running") await audioCtx.resume();
+  setPill("audioState", `Audio: ${audioCtx.state}`, "ok");
+  $("btnPlay").disabled = false;
+  $("btnMic").disabled = false;
+  log("Audio started.");
+});
+
+function playTone(freq, startTime, durationSec, level) {
+  const osc = audioCtx.createOscillator();
+  osc.type = "sine";
+  osc.frequency.value = freq;
+
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.0001, startTime);
+  // Short fade in/out to avoid clicks
+  g.gain.exponentialRampToValueAtTime(level, startTime + 0.01);
+  g.gain.setValueAtTime(level, startTime + Math.max(0.01, durationSec - 0.02));
+  g.gain.exponentialRampToValueAtTime(0.0001, startTime + durationSec);
+
+  osc.connect(g).connect(outGain);
+  osc.start(startTime);
+  osc.stop(startTime + durationSec + 0.02);
+}
+
+$("btnPlay").addEventListener("click", () => {
+  ensureAudio();
+  const toneA = parseFloat($("toneA").value);
+  const toneB = parseFloat($("toneB").value);
+  const durA = parseFloat($("durA").value) / 1000;
+  const gap  = parseFloat($("gap").value) / 1000;
+  const durB = parseFloat($("durB").value) / 1000;
+  const level = Math.min(0.9, Math.max(0.01, parseFloat($("level").value)));
+
+  outGain.gain.value = level;
+
+  const t0 = audioCtx.currentTime + 0.05;
+  playTone(toneA, t0, durA, level);
+  playTone(toneB, t0 + durA + gap, durB, level);
+
+  log(`ENCODE: A=${toneA.toFixed(1)}Hz for ${durA.toFixed(2)}s, gap=${gap.toFixed(2)}s, B=${toneB.toFixed(1)}Hz for ${durB.toFixed(2)}s`);
+});
+
+// ===== Decoder (Mic + Goertzel) =====
+let micStream = null;
+let micSource = null;
+let processor = null;
+
+const DecoderState = {
+  IDLE: "IDLE",
+  SEEK_A: "SEEK_A",
+  HAVE_A: "HAVE_A",
+  SEEK_B: "SEEK_B",
+  HAVE_B: "HAVE_B",
+};
+
+let state = DecoderState.IDLE;
+let lastTone = null;
+let toneHoldMs = 0;
+let gotA = null;
+
+function goertzelPower(frame, sampleRate, targetFreq) {
+  const N = frame.length;
+  const k = Math.round((N * targetFreq) / sampleRate);
+  const w = (2 * Math.PI / N) * k;
+  const coeff = 2 * Math.cos(w);
+
+  let s0 = 0, s1 = 0, s2 = 0;
+  for (let i = 0; i < N; i++) {
+    s0 = frame[i] + coeff * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  return (s2 * s2) + (s1 * s1) - (coeff * s1 * s2);
+}
+
+function nearestTone(freq) {
+  let best = QCII_FREQS[0];
+  let bestErr = Math.abs(freq - best);
+  for (const f of QCII_FREQS) {
+    const e = Math.abs(freq - f);
+    if (e < bestErr) { bestErr = e; best = f; }
+  }
+  return { tone: best, err: bestErr };
+}
+
+function findDominantTone(frame, sampleRate, toleranceHz) {
+  // Remove DC a bit
+  let mean = 0;
+  for (let i=0;i<frame.length;i++) mean += frame[i];
+  mean /= frame.length;
+  const x = new Float32Array(frame.length);
+  for (let i=0;i<frame.length;i++) x[i] = frame[i] - mean;
+
+  // Scan powers for all QCII frequencies
+  let bestF = null;
+  let bestP = -Infinity;
+  let secondP = -Infinity;
+
+  for (const f of QCII_FREQS) {
+    const p = goertzelPower(x, sampleRate, f);
+    if (p > bestP) { secondP = bestP; bestP = p; bestF = f; }
+    else if (p > secondP) { secondP = p; }
+  }
+
+  // Simple confidence: best must be sufficiently above second best
+  const ratio = bestP / Math.max(1e-9, secondP);
+  if (ratio < 1.8) return null; // tune this if needed
+
+  // BestF is already from table; still allow tolerance for drift if you later do peak interpolation.
+  return { freq: bestF, ratio };
+}
+
+function resetDecoder() {
+  state = DecoderState.SEEK_A;
+  lastTone = null;
+  toneHoldMs = 0;
+  gotA = null;
+  setPill("decodeState", "Decoder: seeking A", "warn");
+}
+
+function stopDecoder() {
+  if (processor) processor.disconnect();
+  if (micSource) micSource.disconnect();
+  processor = null;
+  micSource = null;
+
+  if (micStream) {
+    micStream.getTracks().forEach(t => t.stop());
+    micStream = null;
+  }
+  state = DecoderState.IDLE;
+  setPill("micState", "Mic: off", "bad");
+  setPill("decodeState", "Decoder: idle", "warn");
+}
+
+$("btnMic").addEventListener("click", async () => {
+  ensureAudio();
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+  } catch (e) {
+    log("Mic permission denied or unavailable.");
+    setPill("micState", "Mic: error", "bad");
+    return;
+  }
+
+  micSource = audioCtx.createMediaStreamSource(micStream);
+
+  // ScriptProcessor: buffer size 1024/2048/4096; 2048 is a good compromise.
+  const bufSize = 2048;
+  processor = audioCtx.createScriptProcessor(bufSize, 1, 1);
+
+  micSource.connect(processor);
+  // Do NOT connect mic to destination (avoid feedback). But processor must be connected somewhere to run.
+  processor.connect(audioCtx.destination);
+
+  resetDecoder();
+  setPill("micState", "Mic: on", "ok");
+  $("btnStop").disabled = false;
+
+  const tol = parseFloat($("tol").value);
+  const frameMs = (bufSize / audioCtx.sampleRate) * 1000;
+
+  processor.onaudioprocess = (evt) => {
+    if (state === DecoderState.IDLE) return;
+
+    const input = evt.inputBuffer.getChannelData(0);
+    const dom = findDominantTone(input, audioCtx.sampleRate, tol);
+    const nowTone = dom ? dom.freq : null;
+
+    // Hold logic
+    if (nowTone && nowTone === lastTone) toneHoldMs += frameMs;
+    else {
+      lastTone = nowTone;
+      toneHoldMs = nowTone ? frameMs : 0;
+    }
+
+    // State machine tuned for common QCII: A ~1s, B ~3s
+    const aMin = 750, aMax = 1400;
+    const bMin = 2200, bMax = 4200;
+
+    if (state === DecoderState.SEEK_A) {
+      if (nowTone && toneHoldMs >= aMin) {
+        gotA = nowTone;
+        state = DecoderState.SEEK_B;
+        lastTone = null;
+        toneHoldMs = 0;
+        setPill("decodeState", `Decoder: got A=${gotA.toFixed(1)}Hz, seeking B`, "warn");
+        log(`DECODE: got A=${gotA.toFixed(1)}Hz`);
+      }
+    } else if (state === DecoderState.SEEK_B) {
+      if (nowTone && toneHoldMs >= bMin) {
+        const gotB = nowTone;
+
+        // Basic sanity: A and B should be stable and in table (they are, from scan)
+        log(`DECODE: got B=${gotB.toFixed(1)}Hz`);
+        log(`QCII RESULT: A=${gotA.toFixed(1)}Hz, B=${gotB.toFixed(1)}Hz`);
+
+        setPill("decodeState", `Decoder: QCII A=${gotA.toFixed(1)} B=${gotB.toFixed(1)}`, "ok");
+
+        // After a hit, reset to look for next sequence
+        state = DecoderState.SEEK_A;
+        lastTone = null;
+        toneHoldMs = 0;
+        gotA = null;
+      }
+    }
+  };
+
+  log("Decoder started (mic).");
+});
+
+$("btnStop").addEventListener("click", () => {
+  stopDecoder();
+  $("btnStop").disabled = true;
+  log("Decoder stopped.");
+});
+
+// Stop on page close
+window.addEventListener("beforeunload", () => stopDecoder());
+</script>
+</body>
+</html>
